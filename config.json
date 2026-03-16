@@ -1,0 +1,21 @@
+{
+    "auto_msg_enabled": false,
+    "auto_reply_enabled": true,
+    "auto_reply_channels": [
+    ],
+    "respected_ids": [
+    ],
+    "personality_overrides": {},
+    "tasks": [],
+    "user_relationships": {
+    },
+    "server_culture": {
+        "slang": [
+        ],
+        "trending_topics": [
+        ]
+    },
+    "game_states": {},
+    "user_age_verified": {
+    }
+}

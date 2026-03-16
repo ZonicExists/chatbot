@@ -1,0 +1,11 @@
+.env
+chroma_db/chroma.sqlite3
+cogs/__pycache__/ai_agent.cpython-313.pyc
+utils/__pycache__/personalities.cpython-313.pyc
+utils/__pycache__/vector_store.cpython-313.pyc
+utils/__pycache__/tools.cpython-313.pyc
+chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/data_level0.bin
+chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/header.bin
+chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/link_lists.bin
+chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/length.bin
+expressions.txt
