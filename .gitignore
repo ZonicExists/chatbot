@@ -10,3 +10,5 @@ chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/link_lists.bin
 chroma_db/dba6a7c8-aeb4-45c9-97b7-e633edd65e2c/length.bin
 expressions.txt
 config.json
+*.json
+config.json
