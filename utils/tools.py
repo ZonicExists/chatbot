@@ -44,8 +44,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('url')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True):
+    async def from_url(cls, url, *, loop=None, stream=True, bot=None):
+        if not loop and bot:
+            loop = getattr(bot, 'loop', None)
         loop = loop or asyncio.get_event_loop()
+        
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
         if 'entries' in data:
             data = data['entries'][0]
@@ -63,13 +66,14 @@ def get_tools(bot):
 
     async def play_next(guild_id, voice_client):
         state = get_guild_state(guild_id)
+        bot_loop = getattr(bot, 'loop', None) or asyncio.get_event_loop()
         
         # Check if requester is still in VC
         if state['requester_id']:
             guild = bot.get_guild(guild_id)
             requester = guild.get_member(int(state['requester_id']))
             if not requester or not requester.voice or requester.voice.channel != voice_client.channel:
-                print(f"Requester {state['requester_id']} left VC. Stopping.")
+                logger.info(f"Requester {state['requester_id']} left VC. Stopping.")
                 state['queue'] = []
                 state['last_song'] = None
                 state['requester_id'] = None
@@ -88,16 +92,14 @@ def get_tools(bot):
             # Fetch recommended song based on last_song
             try:
                 search_query = f"ytsearch5:related songs to {state['last_song']}"
-                loop = bot.loop or asyncio.get_event_loop()
-                info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+                info = await bot_loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
                 if 'entries' in info and len(info['entries']) > 1:
                     # Pick the second or third result to avoid playing the same song again
-                    # Usually the first result is the song itself
                     idx = 1 if len(info['entries']) > 1 else 0
                     next_query = info['entries'][idx]['webpage_url']
-                    print(f"Autoplay recommending: {info['entries'][idx]['title']}")
+                    logger.info(f"Autoplay recommending: {info['entries'][idx]['title']}")
             except Exception as e:
-                print(f"Error fetching autoplay recommendation: {e}")
+                logger.error(f"Error fetching autoplay recommendation: {e}")
 
         if next_query:
             try:
@@ -106,36 +108,39 @@ def get_tools(bot):
                 if state['bass'] > 0:
                     current_ffmpeg_options['options'] += f' -af "bass=g={state["bass"]}"'
 
-                player = await YTDLSource.from_url(next_query, loop=bot.loop, stream=True)
+                player = await YTDLSource.from_url(next_query, loop=bot_loop, stream=True, bot=bot)
                 state['last_song'] = player.title
                 
                 def after_playing(error):
-                    if error: print(f"Player error: {error}")
+                    if error: logger.error(f"Player error: {error}")
                     if state['loop'] and not error:
                         state['queue'].insert(0, next_query)
                     
                     # Schedule next song or disconnect timer
-                    asyncio.run_coroutine_threadsafe(play_next(guild_id, voice_client), bot.loop)
+                    asyncio.run_coroutine_threadsafe(play_next(guild_id, voice_client), bot_loop)
 
                 voice_client.play(player, after=after_playing)
             except Exception as e:
-                print(f"Error playing next: {e}")
-                asyncio.run_coroutine_threadsafe(play_next(guild_id, voice_client), bot.loop)
+                logger.error(f"Error playing next: {e}")
+                asyncio.run_coroutine_threadsafe(play_next(guild_id, voice_client), bot_loop)
         else:
             # No more songs, start 30s disconnect timer
             async def _wait_and_disconnect():
-                await asyncio.sleep(30)
-                if voice_client.is_connected() and not voice_client.is_playing() and not state['queue']:
-                    await voice_client.disconnect()
-                    print(f"Disconnected from {guild_id} due to inactivity.")
+                try:
+                    await asyncio.sleep(30)
+                    if voice_client.is_connected() and not voice_client.is_playing() and not state['queue']:
+                        await voice_client.disconnect()
+                        logger.info(f"Disconnected from {guild_id} due to inactivity.")
+                except asyncio.CancelledError:
+                    pass
             
-            state['disconnect_task'] = bot.loop.create_task(_wait_and_disconnect())
+            state['disconnect_task'] = bot_loop.create_task(_wait_and_disconnect())
 
     # Web Search Tool
     web_search_tool = TavilySearch(max_results=3, tavily_api_key=os.getenv("TAVILY_API_KEY"))
 
     @tool
-    def play_music(
+    async def play_music(
         query: Annotated[str, "The name or URL of the song to play."],
         user_id: Annotated[str, "The Discord ID of the user."]
     ) -> str:
@@ -155,27 +160,23 @@ def get_tools(bot):
         state = get_guild_state(guild.id)
         voice_client = discord.utils.get(bot.voice_clients, guild=guild)
 
-        async def _play_logic():
-            nonlocal voice_client
-            if not voice_client:
-                voice_client = await member.voice.channel.connect(self_deaf=True)
-            elif voice_client.channel != member.voice.channel:
-                await voice_client.move_to(member.voice.channel)
+        if not voice_client:
+            voice_client = await member.voice.channel.connect(self_deaf=True)
+        elif voice_client.channel != member.voice.channel:
+            await voice_client.move_to(member.voice.channel)
 
-            state['requester_id'] = user_id # Store who started/added to this session
+        state['requester_id'] = user_id # Store who started/added to this session
 
-            if voice_client.is_playing() or voice_client.is_paused():
-                state['queue'].append(query)
-                return f"Added to queue: {query}"
-            else:
-                state['queue'].append(query)
-                await play_next(guild.id, voice_client)
-                return f"Started playing: {query}"
-
-        return asyncio.run_coroutine_threadsafe(_play_logic(), bot.loop).result()
+        if voice_client.is_playing() or voice_client.is_paused():
+            state['queue'].append(query)
+            return f"Added to queue: {query}"
+        else:
+            state['queue'].append(query)
+            await play_next(guild.id, voice_client)
+            return f"Started playing: {query}"
 
     @tool
-    def set_autoplay(enabled: bool, user_id: str) -> str:
+    async def set_autoplay(enabled: bool, user_id: str) -> str:
         """Enables or disables autoplay of related songs when the queue is empty."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -185,7 +186,7 @@ def get_tools(bot):
         return f"Autoplay: {'ENABLED' if state['autoplay'] else 'DISABLED'}."
 
     @tool
-    def list_queue(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
+    async def list_queue(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
         """Lists the current music queue."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -195,7 +196,7 @@ def get_tools(bot):
         return "Music Queue:\n" + "\n".join([f"{i+1}. {q}" for i, q in enumerate(state['queue'])])
 
     @tool
-    def skip_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
+    async def skip_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
         """Skips the current song."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -211,7 +212,7 @@ def get_tools(bot):
         return "Nothing playing."
 
     @tool
-    def stop_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
+    async def stop_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
         """Stops music, clears queue, and leaves."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -222,12 +223,12 @@ def get_tools(bot):
             state['loop'] = False
             state['last_song'] = None
             if state['disconnect_task']: state['disconnect_task'].cancel()
-            asyncio.run_coroutine_threadsafe(voice_client.disconnect(), bot.loop)
+            await voice_client.disconnect()
             return "Stopped and left."
         return "Not in VC."
 
     @tool
-    def pause_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
+    async def pause_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
         """Pauses playback."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -238,7 +239,7 @@ def get_tools(bot):
         return "Not playing."
 
     @tool
-    def resume_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
+    async def resume_music(user_id: Annotated[str, "The Discord ID of the user."]) -> str:
         """Resumes playback."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -249,7 +250,7 @@ def get_tools(bot):
         return "Not paused."
 
     @tool
-    def set_volume(volume: int, user_id: str) -> str:
+    async def set_volume(volume: int, user_id: str) -> str:
         """Sets volume 0-100."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -260,7 +261,7 @@ def get_tools(bot):
         return "Not playing."
 
     @tool
-    def toggle_loop(user_id: str) -> str:
+    async def toggle_loop(user_id: str) -> str:
         """Toggles loop."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -269,7 +270,7 @@ def get_tools(bot):
         return f"Loop: {'ON' if state['loop'] else 'OFF'}."
 
     @tool
-    def set_bass(level: int, user_id: str) -> str:
+    async def set_bass(level: int, user_id: str) -> str:
         """Sets bass 0-20."""
         user_id_int = int(user_id)
         guild = next((g for g in bot.guilds if g.get_member(user_id_int)), None)
@@ -279,13 +280,13 @@ def get_tools(bot):
 
     # --- Other Tools ---
     @tool
-    def query_long_term_memory(query: str, author_id: str) -> str:
+    async def query_long_term_memory(query: str, author_id: str) -> str:
         """Search past chat."""
         res = vector_store.query(query, n_results=2, filter_dict={"author_id": author_id})
         return f"Context:\n{res}" if res else "No memories."
 
     @tool
-    def get_server_stats(guild_id: Annotated[str, "The Discord Guild/Server ID to check."]) -> str:
+    async def get_server_stats(guild_id: Annotated[str, "The Discord Guild/Server ID to check."]) -> str:
         """Retrieves server information like member count and name. Only works for servers the bot is in."""
         try:
             if not guild_id or guild_id == "dm" or guild_id == "0":

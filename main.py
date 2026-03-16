@@ -135,6 +135,10 @@ class AutonomousAgentBot(commands.Bot):
                     is_reply_to_me = True
 
         should_trigger = is_dm or is_mentioned or is_reply_to_me or (self.auto_reply_enabled and is_auto_reply_channel)
+        
+        # Don't trigger AI if it's a bot command
+        if message.content.startswith(self.command_prefix):
+            should_trigger = False
 
         if should_trigger:
             content = message.content

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import aiohttp
 import discord
@@ -232,7 +233,7 @@ class AIAgent(commands.Cog):
                 gs = self.bot.game_states[context_id]
                 game_context = f"\n[GAME SESSION]: {gs['type']}. Current Data: {json.dumps(gs['data'])}. Rules: Update state after moves, reset on win."
 
-            full_system_prompt = state['base_prompt'] + internal_context + culture_context + tool_instructions + game_context
+            full_system_prompt = "Your name is Zade. " + state['base_prompt'] + internal_context + culture_context + tool_instructions + game_context
             if state.get('summary'):
                 full_system_prompt += f"\n[PREVIOUS CONVERSATION SUMMARY]: {state['summary']}"
 
@@ -330,7 +331,7 @@ class AIAgent(commands.Cog):
 
     async def process_ai_request(self, message: discord.Message, text_content: str):
         bucket = self.cooldowns.get_bucket(message)
-        if bucket.update_rate_limit(): return await message.channel.send("⚠️ Slow down!")
+        if bucket.update_rate_limit(): return await message.channel.send("⚠️ Slow down!", delete_after=3)
 
         text_content = " ".join(text_content.split())[:1000]
         user_id_str = str(message.author.id)
@@ -368,7 +369,7 @@ class AIAgent(commands.Cog):
         if is_lounge:
             if message.author.id in self.bot.respected_ids:
                 # Override the witty persona with a polite one to ensure it's effective
-                base_personality = "You are a helpful and polite community member. You are speaking to a respected authority figure, so be courteous and professional. Avoid sarcasm."
+                base_personality = "Your name is Zade. You are a helpful and polite community member. You are speaking to a respected authority figure, so be courteous and professional. Avoid sarcasm."
                 logger.info(f"Respected user {message.author.display_name} ({message.author.id}) recognized in Lounge.")
             else:
                 base_personality += "\n[NORMAL MODE: Use witty/sarcastic lounge persona.]"
@@ -392,7 +393,6 @@ class AIAgent(commands.Cog):
         human_content = [{"type": "text", "text": f"[{message.author.display_name}]: {display_text}"}] + vision_content
 
         # Run vector store addition in the background to avoid blocking the LLM request
-        import asyncio
         asyncio.create_task(vector_store.add_messages([{
             "id": str(message.id),
             "content": display_text,
@@ -555,12 +555,8 @@ class AIAgent(commands.Cog):
             kwargs['user_id'] = self.user_id
             
             try:
-                if asyncio.iscoroutinefunction(tool.invoke) or asyncio.iscoroutine(tool.invoke(kwargs)):
-                    res = await tool.ainvoke(kwargs)
-                else:
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    res = await loop.run_in_executor(None, lambda: tool.invoke(kwargs))
+                # Use ainvoke for all tools as it handles both sync and async internally in LangChain 0.2+
+                res = await tool.ainvoke(kwargs)
             except Exception as e:
                 res = f"Error: {e}"
             
@@ -638,13 +634,8 @@ class AIAgent(commands.Cog):
             return await interaction.followup.send(embed=self._create_music_embed("Error", f"Tool '{tool_name}' not found.", discord.Color.red()))
         
         try:
-            # Check if the tool is async
-            if asyncio.iscoroutinefunction(tool.invoke) or asyncio.iscoroutine(tool.invoke(kwargs)):
-                res = await tool.ainvoke(kwargs)
-            else:
-                import asyncio
-                loop = asyncio.get_running_loop()
-                res = await loop.run_in_executor(None, lambda: tool.invoke(kwargs))
+            # Use ainvoke for all tools as it handles both sync and async internally in LangChain 0.2+
+            res = await tool.ainvoke(kwargs)
         except Exception as e:
             res = f"Error: {e}"
         
@@ -749,15 +740,40 @@ class AIAgent(commands.Cog):
         await self._exec_music_tool(interaction, "generate_image", prompt=prompt)
 
     @app_commands.command(name="auto_reply", description="Manage auto-reply channels.")
-    @app_commands.describe(action="Add, remove, or list channels", channel="The channel to modify (optional for list)")
+    @app_commands.describe(action="Add, remove, or list channels", channel="The channel mention, ID, or name (defaults to current channel)")
     @app_commands.choices(action=[
         app_commands.Choice(name="Add", value="add"),
         app_commands.Choice(name="Remove", value="remove"),
         app_commands.Choice(name="List", value="list")
     ])
     @app_commands.checks.has_permissions(manage_channels=True)
-    async def auto_reply(self, interaction: discord.Interaction, action: app_commands.Choice[str], channel: discord.TextChannel = None):
-        target_channel = channel or interaction.channel
+    async def auto_reply(self, interaction: discord.Interaction, action: app_commands.Choice[str], channel: str = None):
+        if channel:
+            # Parse ID from mention <#123> or use raw string if it's just an ID
+            match = re.search(r'<#(\d+)>', channel)
+            channel_id = None
+            if match:
+                channel_id = int(match.group(1))
+            else:
+                try:
+                    channel_id = int(channel)
+                except ValueError:
+                    # Try to find by name
+                    clean_name = channel.replace("#", "").strip()
+                    found = discord.utils.get(interaction.guild.text_channels, name=clean_name)
+                    if found:
+                        channel_id = found.id
+            
+            if not channel_id:
+                return await interaction.response.send_message("❌ Could not find that channel. Please use a mention (#channel) or a valid ID.", ephemeral=True)
+            
+            target_channel = interaction.guild.get_channel(channel_id)
+        else:
+            target_channel = interaction.channel
+
+        # Force check for Text Channel type
+        if not isinstance(target_channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ Auto-reply can only be enabled for standard **Text Channels**. Threads, Forum channels, and Voice channels are not supported.", ephemeral=True)
         
         if action.value == "add":
             self.bot.auto_reply_channels.add(target_channel.id)
