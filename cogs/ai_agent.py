@@ -115,39 +115,72 @@ class AIAgent(commands.Cog):
             # We summarize periodically to save tokens and maintain speed
             logger.info("Summarizing context internally...")
             
-            # Cleaning messages for summary as well (same logic as call_model)
-            clean_messages = []
+            # Use only the last 20 messages for summary to keep it relevant and small
+            # We also sanitize and filter to ensure a valid role sequence for the provider
+            llm_messages = []
             last_role = None
-            for msg in list(messages[-15:]):
-                if isinstance(msg, HumanMessage): role = "user"
-                elif isinstance(msg, AIMessage): role = "assistant"
-                elif isinstance(msg, SystemMessage): continue
-                elif isinstance(msg, ToolMessage): role = "tool"
-                else: role = "user"
+            
+            for msg in list(messages[-20:]):
+                # Strictly convert content to plain text for summarization
+                # This ensures NO image data/blocks are sent to the LLM
+                content = msg.content
+                text_content = ""
+
+                if isinstance(content, str):
+                    # Strip base64 if it somehow leaked into a string
+                    text_content = re.sub(r'data:image/[^;]+;base64,[a-zA-Z0-9+/=]+', '[Image]', content)
+                elif isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            parts.append(item.get("text", ""))
+                        elif isinstance(item, dict) and item.get("type") == "image_url":
+                            parts.append("[Image]")
+                        else:
+                            parts.append(str(item))
+                    text_content = " ".join(parts)
+                else:
+                    text_content = str(content)
+
+                if isinstance(msg, HumanMessage): 
+                    role = "user"
+                    new_msg = HumanMessage(content=text_content)
+                elif isinstance(msg, AIMessage): 
+                    role = "assistant"
+                    # Use text_content if available, otherwise use a placeholder for tool calls
+                    display_content = text_content
+                    if not display_content and hasattr(msg, "tool_calls") and msg.tool_calls:
+                        tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
+                        display_content = f"[Called tools: {', '.join(tool_names)}]"
+                    
+                    if not display_content:
+                        continue
+                    new_msg = AIMessage(content=display_content)
+                else: 
+                    # Skip SystemMessage and ToolMessage for summary
+                    continue
 
                 if role == "user" and last_role == "user":
-                    if clean_messages:
-                        prev_content = clean_messages[-1].content
-                        curr_content = msg.content
-                        
-                        if isinstance(prev_content, str) and isinstance(curr_content, str):
-                            clean_messages[-1].content += f"\n{curr_content}"
-                        else:
-                            if isinstance(prev_content, str):
-                                prev_content = [{"type": "text", "text": prev_content}]
-                            if isinstance(curr_content, str):
-                                curr_content = [{"type": "text", "text": curr_content}]
-                            clean_messages[-1].content = prev_content + curr_content
+                    if llm_messages:
+                        llm_messages[-1].content += f"\n{text_content}"
                     continue
-                clean_messages.append(msg)
+                
+                llm_messages.append(new_msg)
                 last_role = role
+
+            # Ensure the sequence starts with a User message (required by most providers)
+            while llm_messages and not isinstance(llm_messages[0], HumanMessage):
+                llm_messages.pop(0)
+
+            if not llm_messages:
+                return {"summary": state.get("summary", "")}
 
             summary_prompt = (
                 "Summarize the conversation so far into 2 sentences max. "
                 f"Previous summary: {state.get('summary', 'None')}"
             )
             try:
-                response = await self.llm.ainvoke([SystemMessage(content=summary_prompt)] + clean_messages)
+                response = await self.llm.ainvoke([SystemMessage(content=summary_prompt)] + llm_messages)
                 return {"summary": response.content} 
             except Exception as e:
                 logger.error(f"Summarization Error: {e}")
@@ -213,6 +246,10 @@ class AIAgent(commands.Cog):
             # HARD TRIM for LLM context: Keep only last 40 messages for longer memory
             if len(llm_messages) > 40:
                 llm_messages = llm_messages[-40:]
+            
+            # Ensure it starts with a user message (required by many providers)
+            while llm_messages and not isinstance(llm_messages[0], HumanMessage):
+                llm_messages.pop(0)
             
             context_id = state['context_id']
             user_id = state['user_id']
@@ -447,8 +484,10 @@ class AIAgent(commands.Cog):
                 
                 if final_response:
                     if image_file:
-                        await self._send_split_message(message, final_response)
-                        await message.channel.send(file=image_file)
+                        # Combine text and image into a single embed
+                        embed = discord.Embed(description=final_response, color=discord.Color.random())
+                        embed.set_image(url=f"attachment://{image_file.filename}")
+                        await message.reply(embed=embed, file=image_file)
                     else:
                         await self._send_split_message(message, final_response)
                 elif image_file:
@@ -489,7 +528,7 @@ class AIAgent(commands.Cog):
             if not msg.author.bot: history.append(f"{msg.author.name}: {msg.content}")
         if not history: return await interaction.followup.send("No data.")
         try:
-            response = await self.llm.ainvoke([SystemMessage(content="Summarize in 3 sentences."), HumanMessage(content="\n".join(history[:40]))])
+            response = await self.llm.ainvoke([SystemMessage(content="Your name is Zade. Summarize the following conversation in 3 concise sentences."), HumanMessage(content="\n".join(history[:40]))])
             await self._send_split_message(interaction, self._get_clean_text(response.content), prefix="### 📋 Recap\n")
         except: await interaction.followup.send("Failed.")
 
@@ -499,7 +538,7 @@ class AIAgent(commands.Cog):
         context = vector_store.query(query, n_results=2, filter_dict={"author_id": str(interaction.user.id)})
         if not context: return await interaction.followup.send("❌ No memories.")
         try:
-            response = await self.llm.ainvoke([SystemMessage(content="Use context to answer."), HumanMessage(content=f"Query: {query}\n\nContext: {context}")])
+            response = await self.llm.ainvoke([SystemMessage(content="Your name is Zade. Use the following context from your memory to answer the user's query naturally."), HumanMessage(content=f"Query: {query}\n\nContext: {context}")])
             await self._send_split_message(interaction, self._get_clean_text(response.content), prefix=f"### 🧠 Memory\n")
         except: await interaction.followup.send("Failed.")
 
@@ -523,7 +562,7 @@ class AIAgent(commands.Cog):
         await interaction.response.defer()
         prompt = f"Summarize report. Stats: {interaction.guild.name}, {interaction.guild.member_count} members."
         try:
-            response = await self.llm.ainvoke([SystemMessage(content="You are a data analyst."), HumanMessage(content=prompt)])
+            response = await self.llm.ainvoke([SystemMessage(content="Your name is Zade and you are a data analyst. Provide a professional summary of the server report."), HumanMessage(content=prompt)])
             await self._send_split_message(interaction, self._get_clean_text(response.content), prefix="### 📊 Report\n")
         except: await interaction.followup.send("Failed.")
 
@@ -532,9 +571,9 @@ class AIAgent(commands.Cog):
         await interaction.response.send_message(f"🏓 {round(self.bot.latency * 1000)}ms")
 
     # --- Music Commands ---
-    def _create_music_embed(self, title: str, description: str, color: discord.Color = discord.Color.blue()):
+    def _create_bot_embed(self, title: str, description: str, color: discord.Color = discord.Color.blue(), footer: str = "🎵 Music System"):
         embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.set_footer(text="🎵 Music System")
+        embed.set_footer(text=footer)
         return embed
 
     # --- Music View ---
@@ -571,7 +610,7 @@ class AIAgent(commands.Cog):
             elif tool_name == "stop_music": title = "⏹️ Stopped"
             elif tool_name == "toggle_loop": title = "🔁 Loop"
 
-            embed = self.cog._create_music_embed(title, res, color)
+            embed = self.cog._create_bot_embed(title, res, color, footer="🎵 Music System")
             await interaction.edit_original_response(embed=embed, view=self)
 
         @discord.ui.button(label="Pause/Resume", style=discord.ButtonStyle.secondary, emoji="⏯️")
@@ -631,7 +670,7 @@ class AIAgent(commands.Cog):
 
         tool = next((t for t in self.tools if t.name == tool_name), None)
         if not tool:
-            return await interaction.followup.send(embed=self._create_music_embed("Error", f"Tool '{tool_name}' not found.", discord.Color.red()))
+            return await interaction.followup.send(embed=self._create_bot_embed("Error", f"Tool '{tool_name}' not found.", discord.Color.red(), footer="🤖 System"))
         
         try:
             # Use ainvoke for all tools as it handles both sync and async internally in LangChain 0.2+
@@ -644,6 +683,7 @@ class AIAgent(commands.Cog):
             color = discord.Color.orange()
         
         title = "🎶 Music Update"
+        footer = "🎵 Music System"
         image_url = None
         image_file = None
         
@@ -659,6 +699,7 @@ class AIAgent(commands.Cog):
         elif tool_name == "set_autoplay": title = "📻 Autoplay"
         elif tool_name == "generate_image": 
             title = "🎨 Image Generation"
+            footer = "🎨 Image Generation System"
             if "Generated Image: " in res:
                 raw_data = res.replace("Generated Image: ", "").strip()
                 if raw_data.startswith("data:image"):
@@ -682,18 +723,28 @@ class AIAgent(commands.Cog):
                 else:
                     image_url = raw_data
                 res = f"**Prompt:** {kwargs.get('prompt', 'Unknown')}"
+                color = discord.Color.random()
 
-        view = self.MusicControlView(self, user_id)
-        embed = self._create_music_embed(title, res, color)
+        # Only show music controls for actual music tools
+        music_tools = [
+            "play_music", "pause_music", "resume_music", "skip_music", 
+            "stop_music", "toggle_loop", "list_queue", "set_volume", 
+            "set_bass", "set_autoplay"
+        ]
+        view = self.MusicControlView(self, user_id) if tool_name in music_tools else None
+        
+        embed = self._create_bot_embed(title, res, color, footer=footer)
         if image_url:
             embed.set_image(url=image_url)
         elif image_file:
             embed.set_image(url=f"attachment://{image_file.filename}")
         
-        if image_file:
-            await interaction.followup.send(embed=embed, view=view, file=image_file)
-        else:
-            await interaction.followup.send(embed=embed, view=view)
+        # Build send arguments dynamically to avoid passing None to 'view'
+        send_args = {"embed": embed}
+        if view: send_args["view"] = view
+        if image_file: send_args["file"] = image_file
+        
+        await interaction.followup.send(**send_args)
 
     @app_commands.command(name="play", description="Play music.")
     async def play(self, interaction: discord.Interaction, query: str):
@@ -748,6 +799,8 @@ class AIAgent(commands.Cog):
     ])
     @app_commands.checks.has_permissions(manage_channels=True)
     async def auto_reply(self, interaction: discord.Interaction, action: app_commands.Choice[str], channel: str = None):
+        await interaction.response.defer(ephemeral=True)
+        
         if channel:
             # Parse ID from mention <#123> or use raw string if it's just an ID
             match = re.search(r'<#(\d+)>', channel)
@@ -765,7 +818,7 @@ class AIAgent(commands.Cog):
                         channel_id = found.id
             
             if not channel_id:
-                return await interaction.response.send_message("❌ Could not find that channel. Please use a mention (#channel) or a valid ID.", ephemeral=True)
+                return await interaction.followup.send("❌ Could not find that channel. Please use a mention (#channel) or a valid ID.", ephemeral=True)
             
             target_channel = interaction.guild.get_channel(channel_id)
         else:
@@ -773,23 +826,23 @@ class AIAgent(commands.Cog):
 
         # Force check for Text Channel type
         if not isinstance(target_channel, discord.TextChannel):
-            return await interaction.response.send_message("❌ Auto-reply can only be enabled for standard **Text Channels**. Threads, Forum channels, and Voice channels are not supported.", ephemeral=True)
+            return await interaction.followup.send("❌ Auto-reply can only be enabled for standard **Text Channels**. Threads, Forum channels, and Voice channels are not supported.", ephemeral=True)
         
         if action.value == "add":
             self.bot.auto_reply_channels.add(target_channel.id)
             self.bot.save_persistent_config()
-            await interaction.response.send_message(f"✅ Added {target_channel.mention} to auto-reply channels.")
+            await interaction.followup.send(f"✅ Added {target_channel.mention} to auto-reply channels.", ephemeral=True)
         elif action.value == "remove":
             if target_channel.id in self.bot.auto_reply_channels:
                 self.bot.auto_reply_channels.remove(target_channel.id)
                 self.bot.save_persistent_config()
-                await interaction.response.send_message(f"❌ Removed {target_channel.mention} from auto-reply channels.")
+                await interaction.followup.send(f"❌ Removed {target_channel.mention} from auto-reply channels.", ephemeral=True)
             else:
-                await interaction.response.send_message(f"⚠️ {target_channel.mention} is not in the list.", ephemeral=True)
+                await interaction.followup.send(f"⚠️ {target_channel.mention} is not in the list.", ephemeral=True)
         elif action.value == "list":
             channels = [f"<#{cid}>" for cid in self.bot.auto_reply_channels]
             list_str = "\n".join(channels) if channels else "None"
-            await interaction.response.send_message(f"### 🤖 Auto-Reply Channels:\n{list_str}")
+            await interaction.followup.send(f"### 🤖 Auto-Reply Channels:\n{list_str}", ephemeral=True)
 
     @app_commands.command(name="vibe_check", description="Server vibe.")
     @app_commands.checks.has_permissions(manage_guild=True)
