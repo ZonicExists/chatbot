@@ -1,6 +1,9 @@
 import os
 import json
 import discord
+import aiohttp
+import asyncio
+import time
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -19,36 +22,43 @@ class AutonomousAgentBot(commands.Bot):
         intents.dm_messages = True
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.channel_activity = {}  # Tracks timestamps for nudge system
+        self.session: aiohttp.ClientSession = None
         self.load_persistent_config()
 
     def load_persistent_config(self):
         """Load toggles and channels from JSON with hardcoded defaults."""
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
-                self.auto_msg_enabled = data.get("auto_msg_enabled", False)
-                self.auto_reply_enabled = data.get("auto_reply_enabled", True)
-                self.auto_reply_channels = set(int(id_) for id_ in data.get("auto_reply_channels", []))
-                self.respected_ids = set(int(id_) for id_ in data.get("respected_ids", []))
-                self.personality_overrides = data.get("personality_overrides", {})
-                self.tasks = data.get("tasks", [])
-                self.user_relationships = data.get("user_relationships", {})
-                self.server_culture = data.get("server_culture", {"slang": [], "trending_topics": []})
-                self.game_states = data.get("game_states", {})
-                self.user_age_verified = data.get("user_age_verified", {})
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    data = json.load(f)
+                    self.auto_msg_enabled = data.get("auto_msg_enabled", False)
+                    self.auto_reply_enabled = data.get("auto_reply_enabled", True)
+                    self.auto_reply_channels = set(int(id_) for id_ in data.get("auto_reply_channels", []))
+                    self.respected_ids = set(int(id_) for id_ in data.get("respected_ids", []))
+                    self.personality_overrides = data.get("personality_overrides", {})
+                    self.tasks = data.get("tasks", [])
+                    self.user_relationships = data.get("user_relationships", {})
+                    self.server_culture = data.get("server_culture", {"slang": [], "trending_topics": []})
+                    self.game_states = data.get("game_states", {})
+                    self.user_age_verified = data.get("user_age_verified", {})
+            except Exception as e:
+                print(f"Error loading config: {e}. Using defaults.")
+                self._set_defaults()
         else:
-            # First-run defaults
-            self.auto_msg_enabled = False
-            self.auto_reply_enabled = True
-            self.auto_reply_channels = set()
-            self.respected_ids = set()
-            self.personality_overrides = {}
-            self.tasks = []
-            self.user_relationships = {}
-            self.server_culture = {"slang": [], "trending_topics": []}
-            self.game_states = {}
-            self.user_age_verified = {}
+            self._set_defaults()
             self.save_persistent_config()
+
+    def _set_defaults(self):
+        self.auto_msg_enabled = False
+        self.auto_reply_enabled = True
+        self.auto_reply_channels = set()
+        self.respected_ids = set()
+        self.personality_overrides = {}
+        self.tasks = []
+        self.user_relationships = {}
+        self.server_culture = {"slang": [], "trending_topics": []}
+        self.game_states = {}
+        self.user_age_verified = {}
 
     def save_persistent_config(self):
         """Save current state to JSON."""
@@ -66,16 +76,21 @@ class AutonomousAgentBot(commands.Bot):
                 "user_age_verified": self.user_age_verified
             }, f, indent=4)
 
-
     async def setup_hook(self):
-        # ... (rest of setup_hook)
+        # Create a persistent session for the bot
+        self.session = aiohttp.ClientSession()
         await self.load_extension("cogs.ai_agent")
         print("Cogs loaded.")
         await self.tree.sync()
         print("Slash commands synced.")
 
+    async def close(self):
+        # Ensure session is closed when bot stops
+        if self.session:
+            await self.session.close()
+        await super().close()
+
     async def on_ready(self):
-        # ... (on_ready logic)
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         print("------")
         
@@ -103,8 +118,6 @@ class AutonomousAgentBot(commands.Bot):
                 return
 
         # --- AI-Moderation Nudge System ---
-        # Track activity to detect heated moments (e.g., 5 messages in 10 seconds)
-        import time
         now = time.time()
         chan_id = message.channel.id
         
@@ -112,13 +125,11 @@ class AutonomousAgentBot(commands.Bot):
             self.channel_activity[chan_id] = []
         self.channel_activity[chan_id].append(now)
         
-        # Keep only the last 5 messages' timestamps
         if len(self.channel_activity[chan_id]) > 5:
             self.channel_activity[chan_id].pop(0)
 
-        # If 5 messages were sent in less than 10 seconds, trigger a nudge check
         if len(self.channel_activity[chan_id]) == 5 and (now - self.channel_activity[chan_id][0]) < 10:
-            self.channel_activity[chan_id].clear() # Reset to avoid spam
+            self.channel_activity[chan_id].clear()
             if ai_cog:
                 self.loop.create_task(ai_cog.check_and_nudge(message.channel))
 
@@ -127,7 +138,6 @@ class AutonomousAgentBot(commands.Bot):
         is_mentioned = self.user.mentioned_in(message)
         is_auto_reply_channel = message.channel.id in self.auto_reply_channels
         
-        # New: Check if the message is a reply to the bot
         is_reply_to_me = False
         if message.reference and message.reference.message_id:
             if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
@@ -136,7 +146,6 @@ class AutonomousAgentBot(commands.Bot):
 
         should_trigger = is_dm or is_mentioned or is_reply_to_me or (self.auto_reply_enabled and is_auto_reply_channel)
         
-        # Don't trigger AI if it's a bot command
         if message.content.startswith(self.command_prefix):
             should_trigger = False
 
@@ -148,7 +157,6 @@ class AutonomousAgentBot(commands.Bot):
             if ai_cog:
                 await ai_cog.process_ai_request(message, content)
 
-        # Allow commands to still work
         await self.process_commands(message)
 
 if __name__ == "__main__":

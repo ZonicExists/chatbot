@@ -279,8 +279,46 @@ class AIAgent(commands.Cog):
             
             logger.info(f"--- Thinking (Msgs: {len(final_to_send)}) ---")
             
-            # Use ainvoke for speed
-            response = await model_with_tools.ainvoke(final_to_send)
+            try:
+                # Use ainvoke for speed
+                response = await model_with_tools.ainvoke(final_to_send)
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if the error is related to vision/image support
+                if any(phrase in error_str for phrase in ["image input", "support image", "vision", "404", "multimodal"]):
+                    logger.warning(f"Vision failure for model {self.model_name}, retrying without images. Error: {e}")
+                    
+                    # Re-process messages to strip images
+                    no_vision_messages = []
+                    for msg in final_to_send:
+                        if isinstance(msg.content, list):
+                            # Filter out image_url blocks
+                            new_content = [item for item in msg.content if not (isinstance(item, dict) and item.get("type") == "image_url")]
+                            
+                            # If we stripped everything, add a placeholder
+                            if not new_content:
+                                new_content = "[Image Attachment]"
+                            
+                            # Create a new message of the same type to be safe
+                            if isinstance(msg, HumanMessage):
+                                no_vision_messages.append(HumanMessage(content=new_content, name=getattr(msg, "name", None)))
+                            elif isinstance(msg, AIMessage):
+                                no_vision_messages.append(AIMessage(content=new_content, tool_calls=getattr(msg, "tool_calls", [])))
+                            elif isinstance(msg, ToolMessage):
+                                no_vision_messages.append(ToolMessage(content=new_content, tool_call_id=msg.tool_call_id))
+                            else:
+                                # Fallback for other message types
+                                no_vision_messages.append(HumanMessage(content=new_content))
+                        else:
+                            # Content is already a string (SystemMessage or simple Human/AI message)
+                            no_vision_messages.append(msg)
+                    
+                    # Retry without images
+                    response = await model_with_tools.ainvoke(no_vision_messages)
+                else:
+                    # If it's a different error, re-raise it
+                    raise e
+
             return {"messages": [response]}
 
         workflow = StateGraph(AgentState)
@@ -310,16 +348,17 @@ class AIAgent(commands.Cog):
         for attachment in message.attachments:
             if any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(attachment.url) as resp:
-                            if resp.status == 200:
-                                image_data = await resp.read()
-                                base64_image = base64.b64encode(image_data).decode("utf-8")
-                                content.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                                })
-                except: pass
+                    # Use the persistent session from the bot
+                    async with self.bot.session.get(attachment.url) as resp:
+                        if resp.status == 200:
+                            image_data = await resp.read()
+                            base64_image = base64.b64encode(image_data).decode("utf-8")
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                            })
+                except Exception as e:
+                    logger.error(f"Error downloading attachment: {e}")
         return content
 
     def _get_clean_text(self, content) -> str:
@@ -496,7 +535,11 @@ class AIAgent(commands.Cog):
                     logger.warning("No AIMessage found in final state.")
             except Exception as e:
                 logger.error(f"Thinking Error: {e}")
-                await message.reply("❌ Error thinking.")
+                err_msg = str(e).lower()
+                if any(p in err_msg for p in ["dns", "connection", "unreachable", "timeout", "network"]):
+                    await message.reply("📡 I'm having trouble connecting to the AI service. Please try again in a moment.")
+                else:
+                    await message.reply("❌ Error thinking.")
 
     # --- Commands ---
     @app_commands.command(name="start_game", description="Start game.")
